@@ -52,7 +52,7 @@ async function loadWorker(options = {}) {
   const context = {
     mockedConnect: connect, URL, URLSearchParams, Request, Headers, Response: WorkerResponse,
     TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, DataView, ReadableStream, WritableStream, TransformStream,
-    Buffer, atob, btoa, console, AbortController, queueMicrotask, Event, EventTarget,
+    Buffer, atob, btoa, console, AbortController, queueMicrotask, Event, EventTarget, performance,
     WebSocket: FakeSocket,
     WebSocketPair: class { constructor() { this[0] = new FakeSocket(); this[1] = new FakeSocket(); websocketServers.push(this[1]); } },
     crypto: { getRandomValues: webcrypto.getRandomValues.bind(webcrypto), subtle: {
@@ -256,4 +256,33 @@ test('remote configuration fetches reject HTTP, private IPs, redirects and overs
   await assert.rejects(fetch('https://127.0.0.1'), /Non-public/);
   await assert.rejects(fetch('https://example.com/redirect'), /redirect/);
   await assert.rejects((await fetch('https://example.com/large')).arrayBuffer(), /too large/);
+});
+
+test('login, authenticated admin and setup pages use final static URLs without redirects', async t => {
+  const requested = [];
+  const api = await loadWorker({ fetch: async resource => {
+    const url = new URL(String(resource)); requested.push(url);
+    if (!url.pathname.endsWith('/')) return new Response(null, { status: 301, headers: { Location: url.href + '/' } });
+    return new Response('<html>page loaded</html>', { headers: { 'Content-Type': 'text/html' } });
+  } });
+  t.after(api.cleanup);
+  const store = new Map();
+  const env = { ...environment, ADMIN: 'admin-secret', KEY: 'private-key', KV: {
+    get: async key => store.get(key) || null,
+    put: async (key, value) => store.set(key, value),
+  } };
+  const login = await api.worker.fetch(request('/login'), env, ctx);
+  assert.equal(login.status, 200);
+  assert.match(await login.text(), /page loaded/);
+  const cookie = await api.createRequestWorker().testHash('testprivate-keyadmin-secret');
+  const admin = await api.worker.fetch(request('/admin', { headers: { 'User-Agent': 'test', Cookie: 'auth=' + cookie } }), env, ctx);
+  assert.equal(admin.status, 200);
+  assert.match(await admin.text(), /page loaded/);
+  const missingAdmin = await api.worker.fetch(request('/'), {}, ctx);
+  assert.equal(missingAdmin.status, 404);
+  assert.match(await missingAdmin.text(), /page loaded/);
+  const missingKV = await api.worker.fetch(request('/'), { ADMIN: 'admin-secret' }, ctx);
+  assert.equal(missingKV.status, 404);
+  assert.match(await missingKV.text(), /page loaded/);
+  assert.deepEqual(requested.map(url => url.pathname), ['/login/', '/admin/', '/noADMIN/', '/noKV/']);
 });

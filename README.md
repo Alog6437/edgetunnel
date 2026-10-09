@@ -1,7 +1,4 @@
 # 🚀 edgetunnel 2.1
-
-> 本目录已加入滥用风险限制。部署前必须配置 `ALLOWED_HOSTS`，否则隧道返回 503；客户端中转、DNS 和首页反代等功能默认收紧。请先阅读 [HARDENING.md](./HARDENING.md) 的迁移说明。代码限制不能保证避免 Cloudflare 滥用报告或账号暂停。
-
 ![后台页面](./img.png)
 
 [![Stars](https://img.shields.io/github/stars/cmliu/edgetunnel?style=flat-square&logo=github)](https://github.com/cmliu/edgetunnel/stargazers)
@@ -53,7 +50,7 @@
    - 在 `绑定`选项卡中选择 `添加绑定 +` > `KV 命名空间` > `添加绑定`，然后选择一个已有的命名空间或创建一个新的命名空间进行绑定。
    - `变量名称`填写**KV**，然后点击 `添加绑定`即可。
 
-3. 给 Workers绑定 自定义域：
+3. 给 Workers绑定 自定义域： 
    - 在 workers控制台的 `触发器`选项卡，下方点击 `添加自定义域`。
    - 填入你已转入 CF 域名解析服务的次级域名，例如:`vless.google.com`后 点击`添加自定义域`，等待证书生效即可。
 
@@ -83,7 +80,7 @@
    - 填入你的自定义次级域名，注意不要使用你的根域名，例如：
      您分配到的域名是 `fuck.cloudns.biz`，则添加自定义域填入 `lizi.fuck.cloudns.biz`即可；
    - 按照 CF 的要求将返回你的域名DNS服务商，添加 该自定义域 `lizi`的 CNAME记录 `edgetunnel.pages.dev` 后，点击 `激活域`即可。
-
+   
 4. 访问后台：
    - 访问 `https://lizi.fuck.cloudns.biz/admin` 输入管理员密码即可登录后台。
 

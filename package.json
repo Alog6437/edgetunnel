@@ -1,7 +1,0 @@
-{
-  "name": "edgetunnel-hardened",
-  "private": true,
-  "type": "module",
-  "scripts": { "check": "node --check _worker.js", "test": "node --test" },
-  "engines": { "node": ">=20" }
-}

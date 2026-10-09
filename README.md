@@ -27,6 +27,36 @@
 
 作者保留随时更新本免责声明的权利，且不另行通知。最新版本的免责声明将发布在本项目的 GitHub 页面上。
 
+## 滥用风险收紧（本地修改）
+
+不能保证避免报告或封号。上游 [#1568](https://github.com/cmliu/edgetunnel/issues/1568) 有 Pages 和旧版本用户收到报告的反馈，[#1554](https://github.com/cmliu/edgetunnel/issues/1554) 有 Workers 用户的反馈；这些是用户经历，不能证明检测机制或具体原因。Cloudflare [服务条款 §2.7](https://www.cloudflare.com/terms/) 禁止垃圾邮件、钓鱼及其他技术滥用。更换域名、部署平台或版本不能证明符合条款。
+
+本次收紧出站行为，部署后存在兼容性变化：
+
+| 环境变量 | 默认与作用 |
+| --- | --- |
+| `TUNNEL_ENABLED` | 设置 `false` 拒绝新的 WebSocket 隧道；不终止已建立连接 |
+| `ALLOWED_PORTS` | 默认 `80,443`；逗号分隔。邮件端口 25/465/587 始终禁止 |
+| `ALLOWED_HOSTS` | 可选目标白名单，如 `api.example.com,*.example.org`；通配项仅匹配子域，留空仍允许任意目标域名 |
+| `ALLOW_DNS` | 默认关闭；仅 `true` 启用原有 DNS 隧道 |
+| `ALLOW_CLIENT_PROXY` | 默认禁止 URL 指定 ProxyIP/SOCKS/HTTP 中转；仅 `true` 恢复，建议保持关闭 |
+| `TUNNEL_RATE_LIMITER` | 可选 Workers Rate Limiting binding，限制新连接总量；没有 binding 时不限流 |
+
+移除了失败重试时的内置公共 ProxyIP，以及默认公共 DNS64。需要中转时仅配置自己获授权使用的 `PROXYIP` / `SOCKS5` / `HTTP`；NAT64 仅在显式设置 `DNS64` / `NAT64` 时尝试。目标端口和白名单在选择中转之前检查。域名白名单不验证 DNS 解析结果，也不能防止白名单服务自身被滥用。
+
+Workers 可在 wrangler.toml 添加以下可选 binding（需要支持此配置的 Wrangler；Pages 需另外确认平台支持）：
+
+```toml
+[[ratelimits]]
+name = "TUNNEL_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+```
+
+该限流使用统一的 `tunnel` key；依据[官方文档](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)，计数按 Cloudflare 位置生效且最终一致，并非全局配额、带宽限制或并发连接限制。已有长连接不受影响。共享服务需结合边缘访问控制、监控及更严格的目标白名单；不要公开订阅凭据，泄露后更换 UUID/密钥。
+
+对于已暂停账号，应查看报告详情及邮件中的具体原因，停用涉及的服务并通过报告提供的渠道联系 Cloudflare。代码优化不会自动解除现有处置。本地测试不代表真实 Cloudflare 网络部署验证。
+
 ## 🔥 风险提示
 - 通过提交虚假的节点配置给订阅服务，避免节点配置信息泄露。
 - 另外，您也可以选择自行部署 [WorkerVless2sub 订阅生成服务](https://github.com/cmliu/WorkerVless2sub)，这样既可以利用订阅生成器的便利。
@@ -135,6 +165,7 @@
 | 变量名 | 示例 | 必填 | 备注 | YT |
 |--------|---------|-|-----|-----|
 | UUID | `90cd4a77-141a-43c9-991b-08263cfe9c10` |✅| 可输入任意值(非UUIDv4标准的值会自动切换成动态UUID) | [Video](https://www.youtube.com/watch?v=s91zjpw3-P8&t=72s) |
+| ADMIN_TOKEN | `请使用独立的高强度随机字符串` |❌| 启用 `/edit` 与 `/bestip` 管理页；浏览器认证用户名填写 `admin`，密码填写此变量。请勿与 UUID、KEY 或 TOKEN 共用 | |
 | KEY | `token` |❌| 动态UUID秘钥，使用变量`KEY`的时候，将不再启用变量`UUID`|  |
 | TIME | `7` |❌| 动态UUID有效时间(默认值:`7`天)|  |
 | UPTIME | `3` |❌| 动态UUID更新时间(默认值:北京时间`3`点更新) |  |
@@ -166,7 +197,8 @@
 ## ❗ 注意事项
 
 ### 开启在线编辑优选列表 [视频教程](https://www.youtube.com/watch?v=tKe9xUuFODA&t=630s)
-- 绑定**变量名称**为`KV`的**KV命名空间**，即可在无`SUB`的前提下，在配置页实现在线编辑`ADD`与`ADDAPI`优选列表；
+- 绑定**变量名称**为`KV`的**KV命名空间**，并设置独立的 `ADMIN_TOKEN`，即可在无`SUB`的前提下，在配置页实现在线编辑`ADD`与`ADDAPI`优选列表；
+- 访问管理页时浏览器会显示认证窗口，用户名填写 `admin`，密码填写 `ADMIN_TOKEN`。未配置 `ADMIN_TOKEN` 时管理写入功能保持关闭，订阅和隧道功能不受影响；
 
 ### **关于`KEY`与`UUID`：**
 - 填入`KEY`变量后，将停用`UUID`变量，请确保**二者选其一使用**！
@@ -249,6 +281,17 @@
 
 ## ⭐ Star 星星走起
 [![Stargazers over time](https://starchart.cc/cmliu/edgetunnel.svg?variant=adaptive)](https://starchart.cc/cmliu/edgetunnel)
+
+## ✅ 本地检查
+
+项目的基础检查不需要安装第三方依赖：
+
+```bash
+node --check _worker.js
+node --test
+```
+
+建议使用 Node.js 20 或更高版本；CI 使用 Node.js 22。
 
 ## 💻 已适配客户端
 ### Windows

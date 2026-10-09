@@ -1,6 +1,20 @@
 
 import { connect } from 'cloudflare:sockets';
 
+/**
+ * Cloudflare may reuse one isolate for multiple concurrent requests. The
+ * original implementation kept request-specific configuration in module
+ * globals, which allowed query parameters from one request to affect another
+ * request. Give every request its own closure while the state is gradually
+ * migrated to an explicit context object.
+ */
+export default {
+    fetch(request, env, ctx) {
+        return createRequestWorker().fetch(request, env, ctx);
+    },
+};
+
+function createRequestWorker() {
 let userID = '';
 let proxyIP = '';
 let DNS64Server = '';
@@ -49,9 +63,132 @@ let link = [];
 let banHosts = [atob('c3BlZWQuY2xvdWRmbGFyZS5jb20=')];
 let SCV = 'true';
 let allowInsecure = '&allowInsecure=1';
-export default {
+let tunnelEnv = {};
+
+function assertDestinationAllowed(address, port) {
+    const host = String(address).toLowerCase().replace(/\.$/, '');
+    const ports = String(tunnelEnv.ALLOWED_PORTS || '80,443').split(/[\s,]+/).map(Number);
+    if (!ports.includes(Number(port)) || [25, 465, 587].includes(Number(port))) {
+        throw new Error('出站端口不允许');
+    }
+    if (banHosts.some(item => host === String(item).toLowerCase().replace(/\.$/, ''))) {
+        throw new Error('出站目标已禁止');
+    }
+    const allowed = String(tunnelEnv.ALLOWED_HOSTS || '').toLowerCase().split(/[\s,]+/).filter(Boolean);
+    if (allowed.length && !allowed.some(item => host === item ||
+        (item.startsWith('*.') && host.endsWith(item.slice(1)) && host.length > item.length - 1))) {
+        throw new Error('出站目标不在白名单');
+    }
+}
+
+function constantTimeEqual(left, right) {
+    const a = new TextEncoder().encode(String(left ?? ''));
+    const b = new TextEncoder().encode(String(right ?? ''));
+    let mismatch = a.length ^ b.length;
+    const length = Math.max(a.length, b.length);
+    for (let i = 0; i < length; i++) mismatch |= (a[i] || 0) ^ (b[i] || 0);
+    return mismatch === 0;
+}
+
+function requireAdmin(request, env) {
+    const configuredToken = env.ADMIN_TOKEN;
+    if (!configuredToken) {
+        return new Response('管理功能未启用：请设置 ADMIN_TOKEN 环境变量。', {
+            status: 503,
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        });
+    }
+
+    const authorization = request.headers.get('Authorization') || '';
+    let suppliedToken = '';
+    if (authorization.startsWith('Bearer ')) {
+        suppliedToken = authorization.slice(7);
+    } else if (authorization.startsWith('Basic ')) {
+        try {
+            const decoded = atob(authorization.slice(6));
+            const separator = decoded.indexOf(':');
+            suppliedToken = separator >= 0 ? decoded.slice(separator + 1) : '';
+        } catch (_) {
+            suppliedToken = '';
+        }
+    }
+
+    if (constantTimeEqual(suppliedToken, configuredToken)) return null;
+    return new Response('需要管理员认证。用户名可填写 admin，密码为 ADMIN_TOKEN。', {
+        status: 401,
+        headers: {
+            'Content-Type': 'text/plain;charset=utf-8',
+            'WWW-Authenticate': 'Basic realm="edgetunnel-admin", charset="UTF-8"',
+        },
+    });
+}
+
+function escapeHTML(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+
+async function fetchWithTimeout(resource, options = {}, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort('request timeout'), timeoutMs);
+    try {
+        return await fetch(resource, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function readTextLimited(response, maxBytes = 2 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get('Content-Length') || 0);
+    if (declaredLength > maxBytes) throw new Error(`远程响应超过 ${maxBytes} 字节限制`);
+    if (!response.body) return '';
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let total = 0;
+    let text = '';
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) {
+                await reader.cancel('response too large');
+                throw new Error(`远程响应超过 ${maxBytes} 字节限制`);
+            }
+            text += decoder.decode(value, { stream: true });
+        }
+        return text + decoder.decode();
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+const requestWorker = {
     async fetch(request, env, ctx) {
         try {
+            tunnelEnv = env;
+            if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
+                if (String(env.TUNNEL_ENABLED).toLowerCase() === 'false') {
+                    return new Response('Tunnel disabled', { status: 503 });
+                }
+                const route = new URL(request.url);
+                if (env.ALLOW_CLIENT_PROXY !== 'true' &&
+                    (['proxyip', 'socks5', 'socks'].some(key => route.searchParams.has(key)) ||
+                    /\/(?:proxyip[=.]|pyip=|socks5?=|socks5?:\/\/|http:\/\/)/i.test(route.pathname))) {
+                    return new Response('Client proxy overrides disabled', { status: 403 });
+                }
+                if (env.TUNNEL_RATE_LIMITER) {
+                    const { success } = await env.TUNNEL_RATE_LIMITER.limit({ key: 'tunnel' });
+                    if (!success) return new Response('Too many connections', {
+                        status: 429, headers: { 'Retry-After': '60' },
+                    });
+                }
+            }
             const UA = request.headers.get('User-Agent') || 'null';
             const userAgent = UA.toLowerCase();
             userID = env.UUID || env.uuid || env.PASSWORD || env.pswd || userID;
@@ -89,7 +226,7 @@ export default {
             proxyIP = env.PROXYIP || env.proxyip || proxyIP;
             proxyIPs = await 整理(proxyIP);
             proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-            DNS64Server = env.DNS64 || env.NAT64 || (DNS64Server != '' ? DNS64Server : atob("ZG5zNjQuY21saXVzc3NzLm5ldA=="));
+            DNS64Server = env.DNS64 || env.NAT64 || '';
             socks5Address = env.HTTP || env.SOCKS5 || socks5Address;
             socks5s = await 整理(socks5Address);
             socks5Address = socks5s[Math.floor(Math.random() * socks5s.length)];
@@ -113,7 +250,7 @@ export default {
                 RproxyIP = env.RPROXYIP || !proxyIP ? 'true' : 'false';
             }
 
-            const upgradeHeader = request.headers.get('Upgrade');
+            const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
             const url = new URL(request.url);
             if (!upgradeHeader || upgradeHeader !== 'websocket') {
                 if (env.ADD) addresses = await 整理(env.ADD);
@@ -159,22 +296,36 @@ export default {
                 if (路径 == '/') {
                     if (env.URL302) return Response.redirect(env.URL302, 302);
                     else if (env.URL) return await 代理URL(env.URL, url);
-                    else return new Response(JSON.stringify(request.cf, null, 4), {
+                    else return new Response(JSON.stringify({
+                        service: 'edgetunnel',
+                        status: 'ok',
+                        timestamp: new Date().toISOString(),
+                    }, null, 2), {
                         status: 200,
                         headers: {
                             'content-type': 'application/json',
+                            'cache-control': 'no-store',
                         },
                     });
                 } else if (路径 == `/${fakeUserID}`) {
-                    const fakeConfig = await 生成配置信息(userID, request.headers.get('Host'), sub, 'CF-Workers-SUB', RproxyIP, url, fakeUserID, fakeHostName, env);
+                    const fakeConfig = await 生成配置信息(userID, request.headers.get('Host') || url.host, sub, 'CF-Workers-SUB', RproxyIP, url, fakeUserID, fakeHostName, env);
                     return new Response(`${fakeConfig}`, { status: 200 });
                 } else if (url.pathname == `/${动态UUID}/edit` || 路径 == `/${userID}/edit`) {
+                    const unauthorized = requireAdmin(request, env);
+                    if (unauthorized) return unauthorized;
                     return await KV(request, env);
                 } else if (url.pathname == `/${动态UUID}/bestip` || 路径 == `/${userID}/bestip`) {
+                    const unauthorized = requireAdmin(request, env);
+                    if (unauthorized) return unauthorized;
                     return await bestIP(request, env);
                 } else if (url.pathname == `/${动态UUID}` || 路径 == `/${userID}`) {
-                    await sendMessage(`#获取订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${UA}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`);
-                    const 维列斯Config = await 生成配置信息(userID, request.headers.get('Host'), sub, UA, RproxyIP, url, fakeUserID, fakeHostName, env);
+                    ctx.waitUntil(sendMessage(
+                        `#获取订阅 ${FileName}`,
+                        request.headers.get('CF-Connecting-IP'),
+                        request.cf,
+                        `UA: ${escapeHTML(UA)}</tg-spoiler>\n域名: ${escapeHTML(url.hostname)}\n<tg-spoiler>入口: ${escapeHTML(url.pathname + url.search)}</tg-spoiler>`
+                    ));
+                    const 维列斯Config = await 生成配置信息(userID, request.headers.get('Host') || url.host, sub, UA, RproxyIP, url, fakeUserID, fakeHostName, env);
                     const now = Date.now();
                     //const timestamp = Math.floor(now / 1000);
                     const today = new Date(now);
@@ -257,7 +408,8 @@ export default {
             }
         } catch (err) {
             let e = err;
-            return new Response(e.toString());
+            console.error('请求处理失败', e);
+            return new Response('Internal Server Error', { status: 500 });
         }
     },
 };
@@ -326,6 +478,7 @@ async function 维列斯OverWSHandler(request) {
             }
             // 如果是 UDP 且端口不是 DNS 端口（53），则关闭连接
             if (isUDP) {
+                if (tunnelEnv.ALLOW_DNS !== 'true') throw new Error('DNS 隧道未启用');
                 if (portRemote === 53) {
                     isDns = true;
                 } else {
@@ -343,9 +496,13 @@ async function 维列斯OverWSHandler(request) {
                 return handleDNSQuery(rawClientData, webSocket, 维列斯ResponseHeader, log);
             }
             // 处理 TCP 出站连接
+            assertDestinationAllowed(addressRemote, portRemote);
             if (!banHosts.includes(addressRemote)) {
                 log(`处理 TCP 出站连接 ${addressRemote}:${portRemote}`);
-                handleTCPOutBound(remoteSocketWapper, addressType, addressRemote, portRemote, rawClientData, webSocket, 维列斯ResponseHeader, log);
+                // Wait until the remote socket is installed before accepting the
+                // next WebSocket frame. Otherwise a fast second frame can be
+                // parsed as another VLESS header.
+                await handleTCPOutBound(remoteSocketWapper, addressType, addressRemote, portRemote, rawClientData, webSocket, 维列斯ResponseHeader, log);
             } else {
                 throw new Error(`黑名单关闭 TCP 出站连接 ${addressRemote}:${portRemote}`);
             }
@@ -358,6 +515,8 @@ async function 维列斯OverWSHandler(request) {
         },
     })).catch((err) => {
         log('readableWebSocketStream 管道错误', err);
+        safeCloseWebSocket(webSocket);
+        try { remoteSocketWapper.value?.close(); } catch (_) {}
     });
 
     // 返回一个 WebSocket 升级的响应
@@ -372,8 +531,10 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
     async function useSocks5Pattern(address) {
         if (go2Socks5s.includes(atob('YWxsIGlu')) || go2Socks5s.includes(atob('Kg=='))) return true;
         return go2Socks5s.some(pattern => {
-            let regexPattern = pattern.replace(/\*/g, '.*');
-            let regex = new RegExp(`^${regexPattern}$`, 'i');
+            const regexPattern = pattern
+                .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+                .replace(/\*/g, '.*');
+            const regex = new RegExp(`^${regexPattern}$`, 'i');
             return regex.test(address);
         });
     }
@@ -386,6 +547,10 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
             ? (http ? await httpConnect(address, port, log) : await socks5Connect(addressType, address, port, log))
             : connect({ hostname: address, port: port });
 
+        if (!tcpSocket?.writable || !tcpSocket?.readable) {
+            throw new Error('出站连接初始化失败');
+        }
+
         remoteSocket.value = tcpSocket;
         //log(`connected to ${address}:${port}`);
         const writer = tcpSocket.writable.getWriter();
@@ -396,6 +561,10 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
     }
 
     async function nat64() {
+        if (!DNS64Server) {
+            safeCloseWebSocket(webSocket);
+            return;
+        }
         if (!useSocks) {
             const nat64Proxyip = `[${await resolveToIPv6(addressRemote)}]`;
             log(`NAT64 代理连接到 ${nat64Proxyip}:443`);
@@ -420,7 +589,7 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
         } else {
             // 否则，尝试使用预设的代理 IP（如果有）或原始地址重试连接
             if (!proxyIP || proxyIP == '') {
-                proxyIP = atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg==');
+                return await nat64();
             } else if (proxyIP.includes(']:')) {
                 portRemote = proxyIP.split(']:')[1] || portRemote;
                 proxyIP = proxyIP.split(']:')[0] + "]" || proxyIP;
@@ -577,10 +746,15 @@ function process维列斯Header(维列斯Buffer, userID) {
     const optLength = new Uint8Array(维列斯Buffer.slice(17, 18))[0];
     // 暂时跳过附加选项
 
+    const commandIndex = 18 + optLength;
+    if (维列斯Buffer.byteLength < commandIndex + 4) {
+        return { hasError: true, message: 'truncated VLESS header' };
+    }
+
     // 解析命令（紧跟在选项之后的 1 个字节）
     // 0x01: TCP, 0x02: UDP, 0x03: MUX（多路复用）
     const command = new Uint8Array(
-        维列斯Buffer.slice(18 + optLength, 18 + optLength + 1)
+        维列斯Buffer.slice(commandIndex, commandIndex + 1)
     )[0];
 
     // 0x01 TCP
@@ -604,6 +778,9 @@ function process维列斯Header(维列斯Buffer, userID) {
     const portBuffer = 维列斯Buffer.slice(portIndex, portIndex + 2);
     // port is big-Endian in raw data etc 80 == 0x005d
     const portRemote = new DataView(portBuffer).getUint16(0);
+    if (portRemote === 0) {
+        return { hasError: true, message: 'invalid destination port' };
+    }
 
     // 解析地址类型和地址
     let addressIndex = portIndex + 2;
@@ -621,6 +798,9 @@ function process维列斯Header(维列斯Buffer, userID) {
         case 1:
             // IPv4 地址
             addressLength = 4;
+            if (维列斯Buffer.byteLength < addressValueIndex + addressLength) {
+                return { hasError: true, message: 'truncated IPv4 address' };
+            }
             // 将 4 个字节转为点分十进制格式
             addressValue = new Uint8Array(
                 维列斯Buffer.slice(addressValueIndex, addressValueIndex + addressLength)
@@ -633,6 +813,9 @@ function process维列斯Header(维列斯Buffer, userID) {
                 维列斯Buffer.slice(addressValueIndex, addressValueIndex + 1)
             )[0];
             addressValueIndex += 1;
+            if (!addressLength || 维列斯Buffer.byteLength < addressValueIndex + addressLength) {
+                return { hasError: true, message: 'truncated domain address' };
+            }
             // 解码域名
             addressValue = new TextDecoder().decode(
                 维列斯Buffer.slice(addressValueIndex, addressValueIndex + addressLength)
@@ -641,6 +824,9 @@ function process维列斯Header(维列斯Buffer, userID) {
         case 3:
             // IPv6 地址
             addressLength = 16;
+            if (维列斯Buffer.byteLength < addressValueIndex + addressLength) {
+                return { hasError: true, message: 'truncated IPv6 address' };
+            }
             const dataView = new DataView(
                 维列斯Buffer.slice(addressValueIndex, addressValueIndex + addressLength)
             );
@@ -754,7 +940,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, 维列斯ResponseHeader
     // 2. Socket.readable 将关闭，但没有任何数据
     if (hasIncomingData === false && retry) {
         log(`retry`);
-        retry(); // 调用重试函数，尝试重新建立连接
+        await retry(); // 调用重试函数，尝试重新建立连接
     }
 }
 
@@ -961,7 +1147,11 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
 
     const reader = socket.readable.getReader();
     const encoder = new TextEncoder();
-    let res = (await reader.read()).value;
+    let readResult = await reader.read();
+    if (readResult.done || !readResult.value || readResult.value.length < 2) {
+        throw new Error('SOCKS5 服务器未返回完整的握手响应');
+    }
+    let res = readResult.value;
     // 响应格式（SOCKS5 服务器 -> Worker）:
     // +----+--------+
     // |VER | METHOD |
@@ -969,20 +1159,17 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
     // | 1  |   1	|
     // +----+--------+
     if (res[0] !== 0x05) {
-        log(`SOCKS5 服务器版本错误: 收到 ${res[0]}，期望是 5`);
-        return;
+        throw new Error(`SOCKS5 服务器版本错误: 收到 ${res[0]}，期望是 5`);
     }
     if (res[1] === 0xff) {
-        log("服务器不接受任何认证方法");
-        return;
+        throw new Error("SOCKS5 服务器不接受任何认证方法");
     }
 
     // 如果返回 0x0502，表示需要用户名/密码认证
     if (res[1] === 0x02) {
         log("SOCKS5 服务器需要认证");
         if (!username || !password) {
-            log("请提供用户名和密码");
-            return;
+            throw new Error("SOCKS5 服务器要求用户名和密码");
         }
         // 认证请求格式:
         // +----+------+----------+------+----------+
@@ -990,19 +1177,27 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
         // +----+------+----------+------+----------+
         // | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
         // +----+------+----------+------+----------+
+        const usernameBytes = encoder.encode(username);
+        const passwordBytes = encoder.encode(password);
+        if (usernameBytes.length > 255 || passwordBytes.length > 255) {
+            throw new Error('SOCKS5 用户名或密码超过 255 字节');
+        }
         const authRequest = new Uint8Array([
             1,				   // 认证子协议版本
-            username.length,	// 用户名长度
-            ...encoder.encode(username), // 用户名
-            password.length,	// 密码长度
-            ...encoder.encode(password)  // 密码
+            usernameBytes.length,
+            ...usernameBytes,
+            passwordBytes.length,
+            ...passwordBytes
         ]);
         await writer.write(authRequest);
-        res = (await reader.read()).value;
+        readResult = await reader.read();
+        if (readResult.done || !readResult.value || readResult.value.length < 2) {
+            throw new Error('SOCKS5 服务器未返回完整的认证响应');
+        }
+        res = readResult.value;
         // 期望返回 0x0100 表示认证成功
         if (res[0] !== 0x01 || res[1] !== 0x00) {
-            log("SOCKS5 服务器认证失败");
-            return;
+            throw new Error("SOCKS5 服务器认证失败");
         }
     }
 
@@ -1031,18 +1226,26 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
             );
             break;
         case 2: // 域名
+            const domainBytes = encoder.encode(addressRemote);
+            if (domainBytes.length > 255) throw new Error('目标域名超过 SOCKS5 长度限制');
             DSTADDR = new Uint8Array(
-                [3, addressRemote.length, ...encoder.encode(addressRemote)]
+                [3, domainBytes.length, ...domainBytes]
             );
             break;
         case 3: // IPv6
-            DSTADDR = new Uint8Array(
-                [4, ...addressRemote.split(':').flatMap(x => [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2), 16)])]
-            );
+            const groups = addressRemote.split(':');
+            if (groups.length !== 8) throw new Error('无效的 IPv6 地址');
+            const ipv6Bytes = groups.flatMap(group => {
+                const value = Number.parseInt(group, 16);
+                if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
+                    throw new Error('无效的 IPv6 地址');
+                }
+                return [value >> 8, value & 0xff];
+            });
+            DSTADDR = new Uint8Array([4, ...ipv6Bytes]);
             break;
         default:
-            log(`无效的地址类型: ${addressType}`);
-            return;
+            throw new Error(`无效的地址类型: ${addressType}`);
     }
     const socksRequest = new Uint8Array([5, 1, 0, ...DSTADDR, portRemote >> 8, portRemote & 0xff]);
     // 5: SOCKS5版本, 1: 表示CONNECT请求, 0: 保留字段
@@ -1050,7 +1253,11 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
     await writer.write(socksRequest);
     log('已发送 SOCKS5 请求');
 
-    res = (await reader.read()).value;
+    readResult = await reader.read();
+    if (readResult.done || !readResult.value || readResult.value.length < 2) {
+        throw new Error('SOCKS5 服务器未返回完整的连接响应');
+    }
+    res = readResult.value;
     // 响应格式（SOCKS5 服务器 -> Worker）:
     //  +----+-----+-------+------+----------+----------+
     // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
@@ -1060,8 +1267,7 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
     if (res[1] === 0x00) {
         log("SOCKS5 连接已建立");
     } else {
-        log("SOCKS5 连接建立失败");
-        return;
+        throw new Error(`SOCKS5 连接建立失败，错误码 ${res[1]}`);
     }
     writer.releaseLock();
     reader.releaseLock();
@@ -1075,6 +1281,9 @@ async function socks5Connect(addressType, addressRemote, portRemote, log) {
  * @param {function} log 日志记录函数
  */
 async function httpConnect(addressRemote, portRemote, log) {
+    if (/\r|\n/.test(addressRemote)) {
+        throw new Error('HTTP CONNECT 目标包含非法字符');
+    }
     const { username, password, hostname, port } = parsedSocks5Address;
     const sock = await connect({
         hostname: hostname,
@@ -1114,6 +1323,7 @@ async function httpConnect(addressRemote, portRemote, log) {
     let respText = '';
     let connected = false;
     let responseBuffer = new Uint8Array(0);
+    let prefetchedData = null;
 
     try {
         while (true) {
@@ -1128,6 +1338,9 @@ async function httpConnect(addressRemote, portRemote, log) {
             newBuffer.set(responseBuffer);
             newBuffer.set(value, responseBuffer.length);
             responseBuffer = newBuffer;
+            if (responseBuffer.length > 64 * 1024) {
+                throw new Error('HTTP 代理响应头超过 64 KiB');
+            }
 
             // 将收到的数据转换为文本
             respText = new TextDecoder().decode(responseBuffer);
@@ -1146,21 +1359,7 @@ async function httpConnect(addressRemote, portRemote, log) {
 
                     // 如果响应头之后还有数据，我们需要保存这些数据以便后续处理
                     if (headersEndPos < responseBuffer.length) {
-                        const remainingData = responseBuffer.slice(headersEndPos);
-                        // 创建一个缓冲区来存储这些数据，以便稍后使用
-                        const dataStream = new ReadableStream({
-                            start(controller) {
-                                controller.enqueue(remainingData);
-                            }
-                        });
-
-                        // 创建一个新的TransformStream来处理额外数据
-                        const { readable, writable } = new TransformStream();
-                        dataStream.pipeTo(writable).catch(err => console.error('处理剩余数据错误:', err));
-
-                        // 替换原始readable流
-                        // @ts-ignore
-                        sock.readable = readable;
+                        prefetchedData = responseBuffer.slice(headersEndPos);
                     }
                 } else {
                     const errorMsg = `HTTP代理连接失败: ${headers.split('\r\n')[0]}`;
@@ -1175,13 +1374,41 @@ async function httpConnect(addressRemote, portRemote, log) {
         throw new Error(`处理HTTP代理响应失败: ${err.message}`);
     }
 
-    reader.releaseLock();
-
     if (!connected) {
+        reader.releaseLock();
         throw new Error('HTTP代理连接失败: 未收到成功响应');
     }
 
     log(`HTTP代理连接成功: ${addressRemote}:${portRemote}`);
+    if (prefetchedData) {
+        const tunneledReadable = new ReadableStream({
+            start(controller) {
+                controller.enqueue(prefetchedData);
+                (async () => {
+                    try {
+                        while (true) {
+                            const { value, done } = await reader.read();
+                            if (done) break;
+                            controller.enqueue(value);
+                        }
+                        controller.close();
+                    } catch (error) {
+                        controller.error(error);
+                    }
+                })();
+            },
+            cancel(reason) {
+                return reader.cancel(reason);
+            }
+        });
+        return {
+            readable: tunneledReadable,
+            writable: sock.writable,
+            closed: sock.closed,
+            close: () => sock.close(),
+        };
+    }
+    reader.releaseLock();
     return sock;
 }
 
@@ -1213,12 +1440,15 @@ function socks5AddressParser(address) {
     const latters = latter.split(":");
     // 从末尾提取端口号（因为 IPv6 地址中也包含冒号）
     port = Number(latters.pop());
-    if (isNaN(port)) {
-        throw new Error('无效的 SOCKS 地址格式：端口号必须是数字');
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error('无效的 SOCKS 地址格式：端口号必须是 1-65535 的整数');
     }
 
     // 剩余部分就是主机名（可能是域名、IPv4 或 IPv6 地址）
     hostname = latters.join(":");
+    if (!hostname || /\r|\n/.test(hostname)) {
+        throw new Error('无效的 SOCKS 主机名');
+    }
 
     // 处理 IPv6 地址的特殊情况
     // IPv6 地址包含多个冒号，所以必须用方括号括起来，如 [2001:db8::1]
@@ -1288,7 +1518,6 @@ async function 代理URL(代理网址, 目标网址) {
 
     // 解析目标 URL
     let 解析后的网址 = new URL(完整网址);
-    console.log(解析后的网址);
     // 提取并可能修改 URL 组件
     let 协议 = 解析后的网址.protocol.slice(0, -1) || 'https';
     let 主机名 = 解析后的网址.hostname;
@@ -1305,7 +1534,7 @@ async function 代理URL(代理网址, 目标网址) {
     let 新网址 = `${协议}://${主机名}${路径名}${查询参数}`;
 
     // 反向代理请求
-    let 响应 = await fetch(新网址);
+    let 响应 = await fetchWithTimeout(新网址, {}, 10000);
 
     // 创建新的响应
     let 新响应 = new Response(响应.body, {
@@ -1313,11 +1542,6 @@ async function 代理URL(代理网址, 目标网址) {
         statusText: 响应.statusText,
         headers: 响应.headers
     });
-
-    // 添加自定义头部，包含 URL 信息
-    //新响应.headers.set('X-Proxied-By', 'Cloudflare Worker');
-    //新响应.headers.set('X-Original-URL', 完整网址);
-    新响应.headers.set('X-New-URL', 新网址);
 
     return 新响应;
 }
@@ -1463,14 +1687,14 @@ async function 生成配置信息(userID, hostName, sub, UA, RproxyIP, _url, fak
     if (hostName.includes(".workers.dev")) {
         if (proxyhostsURL && (!proxyhosts || proxyhosts.length == 0)) {
             try {
-                const response = await fetch(proxyhostsURL);
+                const response = await fetchWithTimeout(proxyhostsURL, {}, 5000);
 
                 if (!response.ok) {
                     console.error('获取地址时出错:', response.status, response.statusText);
                     return; // 如果有错误，直接返回
                 }
 
-                const text = await response.text();
+                const text = await readTextLimited(response);
                 const lines = text.split('\n');
                 // 过滤掉空行或只包含空白字符的行
                 const nonEmptyLines = lines.filter(line => line.trim() !== '');
@@ -1651,14 +1875,14 @@ async function 生成配置信息(userID, hostName, sub, UA, RproxyIP, _url, fak
             if (hostName.includes('workers.dev')) {
                 if (proxyhostsURL && (!proxyhosts || proxyhosts.length == 0)) {
                     try {
-                        const response = await fetch(proxyhostsURL);
+                        const response = await fetchWithTimeout(proxyhostsURL, {}, 5000);
 
                         if (!response.ok) {
                             console.error('获取地址时出错:', response.status, response.statusText);
                             return; // 如果有错误，直接返回
                         }
 
-                        const text = await response.text();
+                        const text = await readTextLimited(response);
                         const lines = text.split('\n');
                         // 过滤掉空行或只包含空白字符的行
                         const nonEmptyLines = lines.filter(line => line.trim() !== '');
@@ -1700,12 +1924,13 @@ async function 生成配置信息(userID, hostName, sub, UA, RproxyIP, _url, fak
             if ((!sub || sub == "") && isBase64 == true) {
                 content = await 生成本地订阅(fakeHostName, fakeUserID, noTLS, newAddressesapi, newAddressescsv, newAddressesnotlsapi, newAddressesnotlscsv);
             } else {
-                const response = await fetch(url, {
+                const response = await fetchWithTimeout(url, {
                     headers: {
                         'User-Agent': UA + atob('IENGLVdvcmtlcnMtZWRnZXR1bm5lbC9jbWxpdQ==')
                     }
-                });
-                content = await response.text();
+                }, 10000);
+                if (!response.ok) throw new Error(`订阅服务返回 HTTP ${response.status}`);
+                content = await readTextLimited(response, 5 * 1024 * 1024);
             }
 
             if (_url.pathname == `/${fakeUserID}`) return content;
@@ -1714,7 +1939,7 @@ async function 生成配置信息(userID, hostName, sub, UA, RproxyIP, _url, fak
 
         } catch (error) {
             console.error('Error fetching content:', error);
-            return `Error fetching content: ${error.message}`;
+            throw new Error('订阅生成失败', { cause: error });
         }
     }
 }
@@ -1734,14 +1959,19 @@ async function 整理优选列表(api) {
     try {
         // 使用Promise.allSettled等待所有API请求完成，无论成功或失败
         // 对api数组进行遍历，对每个API地址发起fetch请求
-        const responses = await Promise.allSettled(api.map(apiUrl => fetch(apiUrl, {
-            method: 'get',
-            headers: {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;',
-                'User-Agent': atob('Q0YtV29ya2Vycy1lZGdldHVubmVsL2NtbGl1')
-            },
-            signal: controller.signal // 将AbortController的信号量添加到fetch请求中，以便于需要时可以取消请求
-        }).then(response => response.ok ? response.text() : Promise.reject())));
+        const requests = api.map(async apiUrl => {
+            const response = await fetch(apiUrl, {
+                method: 'get',
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;',
+                    'User-Agent': atob('Q0YtV29ya2Vycy1lZGdldHVubmVsL2NtbGl1')
+                },
+                signal: controller.signal
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return readTextLimited(response);
+        });
+        const responses = await Promise.allSettled(requests);
 
         // 遍历所有响应
         for (const [index, response] of responses.entries()) {
@@ -1812,14 +2042,14 @@ async function 整理测速结果(tls) {
 
     for (const csvUrl of addressescsv) {
         try {
-            const response = await fetch(csvUrl);
+            const response = await fetchWithTimeout(csvUrl, {}, 5000);
 
             if (!response.ok) {
                 console.error('获取CSV地址时出错:', response.status, response.statusText);
                 continue;
             }
 
-            const text = await response.text();// 使用正确的字符编码解析文本内容
+            const text = await readTextLimited(response);// 使用正确的字符编码解析文本内容
             let lines;
             if (text.includes('\r\n')) {
                 lines = text.split('\r\n');
@@ -2014,28 +2244,19 @@ async function 整理(内容) {
     return 地址数组;
 }
 
-async function sendMessage(type, ip, add_data = "") {
+async function sendMessage(type, ip, cf = {}, add_data = "") {
     if (!BotToken || !ChatID) return;
 
     try {
-        let msg = "";
-        const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-        if (response.ok) {
-            const ipInfo = await response.json();
-            msg = `${type}\nIP: ${ip}\n国家: ${ipInfo.country}\n<tg-spoiler>城市: ${ipInfo.city}\n组织: ${ipInfo.org}\nASN: ${ipInfo.as}\n${add_data}`;
-        } else {
-            msg = `${type}\nIP: ${ip}\n<tg-spoiler>${add_data}`;
-        }
+        const msg = `${escapeHTML(type)}\nIP: ${escapeHTML(ip || 'unknown')}\n国家/地区: ${escapeHTML(cf?.country || 'unknown')}\n<tg-spoiler>城市: ${escapeHTML(cf?.city || 'unknown')}\n组织: ${escapeHTML(cf?.asOrganization || 'unknown')}\nASN: ${escapeHTML(cf?.asn || 'unknown')}\n${add_data}`;
 
         const url = `https://api.telegram.org/bot${BotToken}/sendMessage?chat_id=${ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`;
-        return fetch(url, {
-            method: 'GET',
+        return fetchWithTimeout(url, {
+            method: 'POST',
             headers: {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'User-Agent': 'Mozilla/5.0 Chrome/90.0.4430.72'
+                'Accept': 'application/json',
             }
-        });
+        }, 5000);
     } catch (error) {
         console.error('Error sending message:', error);
     }
@@ -2097,11 +2318,17 @@ async function 迁移地址列表(env, txt = 'ADD.txt') {
 
 async function KV(request, env, txt = 'ADD.txt') {
     try {
+        if (request.method !== 'GET' && request.method !== 'POST') {
+            return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+        }
         // POST请求处理
         if (request.method === "POST") {
             if (!env.KV) return new Response("未绑定KV空间", { status: 400 });
             try {
                 const content = await request.text();
+                if (new TextEncoder().encode(content).byteLength > 2 * 1024 * 1024) {
+                    return new Response('内容超过 2 MiB 限制', { status: 413 });
+                }
                 await env.KV.put(txt, content);
                 return new Response("保存成功");
             } catch (error) {
@@ -2214,7 +2441,7 @@ async function KV(request, env, txt = 'ADD.txt') {
                     ${hasKV ? `
                     <textarea class="editor" 
                         placeholder="${decodeURIComponent(atob('QUREJUU3JUE0JUJBJUU0JUJFJThCJUVGJUJDJTlBCnZpc2EuY24lMjMlRTQlQkMlOTglRTklODAlODklRTUlOUYlOUYlRTUlOTAlOEQKMTI3LjAuMC4xJTNBMTIzNCUyM0NGbmF0CiU1QjI2MDYlM0E0NzAwJTNBJTNBJTVEJTNBMjA1MyUyM0lQdjYKCiVFNiVCMyVBOCVFNiU4NCU4RiVFRiVCQyU5QQolRTYlQUYlOEYlRTglQTElOEMlRTQlQjglODAlRTQlQjglQUElRTUlOUMlQjAlRTUlOUQlODAlRUYlQkMlOEMlRTYlQTAlQkMlRTUlQkMlOEYlRTQlQjglQkElMjAlRTUlOUMlQjAlRTUlOUQlODAlM0ElRTclQUIlQUYlRTUlOEYlQTMlMjMlRTUlQTQlODclRTYlQjMlQTgKSVB2NiVFNSU5QyVCMCVFNSU5RCU4MCVFOSU5QyU4MCVFOCVBNiU4MSVFNyU5NCVBOCVFNCVCOCVBRCVFNiU4QiVBQyVFNSU4RiVCNyVFNiU4QiVBQyVFOCVCNSVCNyVFNiU5RCVBNSVFRiVCQyU4QyVFNSVBNiU4MiVFRiVCQyU5QSU1QjI2MDYlM0E0NzAwJTNBJTNBJTVEJTNBMjA1MwolRTclQUIlQUYlRTUlOEYlQTMlRTQlQjglOEQlRTUlODYlOTklRUYlQkMlOEMlRTklQkIlOTglRTglQUUlQTQlRTQlQjglQkElMjA0NDMlMjAlRTclQUIlQUYlRTUlOEYlQTMlRUYlQkMlOEMlRTUlQTYlODIlRUYlQkMlOUF2aXNhLmNuJTIzJUU0JUJDJTk4JUU5JTgwJTg5JUU1JTlGJTlGJUU1JTkwJThECgoKQUREQVBJJUU3JUE0JUJBJUU0JUJFJThCJUVGJUJDJTlBCmh0dHBzJTNBJTJGJTJGcmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSUyRmNtbGl1JTJGV29ya2VyVmxlc3Myc3ViJTJGcmVmcyUyRmhlYWRzJTJGbWFpbiUyRmFkZHJlc3Nlc2FwaS50eHQKCiVFNiVCMyVBOCVFNiU4NCU4RiVFRiVCQyU5QUFEREFQSSVFNyU5QiVCNCVFNiU4RSVBNSVFNiVCNyVCQiVFNSU4QSVBMCVFNyU5QiVCNCVFOSU5MyVCRSVFNSU4RCVCMyVFNSU4RiVBRg=='))}"
-                        id="content">${content}</textarea>
+                        id="content">${escapeHTML(content)}</textarea>
                     <div class="save-container">
                         <button class="back-btn" onclick="goBack()">返回配置页</button>
                         <button class="bestip-btn" onclick="goBestIP()">在线优选IP</button>
@@ -2366,7 +2593,13 @@ async function KV(request, env, txt = 'ADD.txt') {
         `;
 
         return new Response(html, {
-            headers: { "Content-Type": "text/html;charset=utf-8" }
+            headers: {
+                "Content-Type": "text/html;charset=utf-8",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            }
         });
     } catch (error) {
         console.error('处理请求时发生错误:', error);
@@ -2395,9 +2628,9 @@ async function resolveToIPv6(target) {
     // 获取域名的IPv4地址
     async function fetchIPv4(domain) {
         const url = `https://cloudflare-dns.com/dns-query?name=${domain}&type=A`;
-        const response = await fetch(url, {
+        const response = await fetchWithTimeout(url, {
             headers: { 'Accept': 'application/dns-json' }
-        });
+        }, 5000);
 
         if (!response.ok) throw new Error('DNS查询失败');
 
@@ -2583,23 +2816,23 @@ async function bestIP(request, env, txt = 'ADD.txt') {
             let response;
             if (ipSource === 'as13335') {
                 // AS13335列表
-                response = await fetch('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/13335/ipv4-aggregated.txt');
+                response = await fetchWithTimeout('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/13335/ipv4-aggregated.txt', {}, 5000);
             } else if (ipSource === 'as209242') {
                 // AS209242列表
-                response = await fetch('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/209242/ipv4-aggregated.txt');
+                response = await fetchWithTimeout('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/209242/ipv4-aggregated.txt', {}, 5000);
             } else if (ipSource === 'as24429') {
                 // AS24429列表
-                response = await fetch('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/24429/ipv4-aggregated.txt');
+                response = await fetchWithTimeout('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/24429/ipv4-aggregated.txt', {}, 5000);
             } else if (ipSource === 'as199524') {
                 // AS199524列表
-                response = await fetch('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/199524/ipv4-aggregated.txt');
+                response = await fetchWithTimeout('https://raw.githubusercontent.com/ipverse/asn-ip/master/as/199524/ipv4-aggregated.txt', {}, 5000);
             } else if (ipSource === 'cm') {
                 // CM整理列表
-                response = await fetch('https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt');
+                response = await fetchWithTimeout('https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt', {}, 5000);
             } else if (ipSource === 'proxyip') {
                 // 反代IP列表 (直接IP，非CIDR)
-                response = await fetch('https://raw.githubusercontent.com/cmliu/ACL4SSR/main/baipiao.txt');
-                const text = response.ok ? await response.text() : '';
+                response = await fetchWithTimeout('https://raw.githubusercontent.com/cmliu/ACL4SSR/main/baipiao.txt', {}, 5000);
+                const text = response.ok ? await readTextLimited(response) : '';
                 
                 // 解析并过滤符合端口的IP
                 const allLines = text.split('\n')
@@ -2628,10 +2861,10 @@ async function bestIP(request, env, txt = 'ADD.txt') {
                 }
             } else {
                 // CF官方列表 (默认)
-                response = await fetch('https://www.cloudflare.com/ips-v4/');
+                response = await fetchWithTimeout('https://www.cloudflare.com/ips-v4/', {}, 5000);
             }
 
-            const text = response.ok ? await response.text() : `173.245.48.0/20
+            const text = response.ok ? await readTextLimited(response) : `173.245.48.0/20
 103.21.244.0/22
 103.22.200.0/22
 103.31.4.0/22
@@ -2831,6 +3064,10 @@ async function bestIP(request, env, txt = 'ADD.txt') {
         return Array.from(ips);
     }
 
+    if (request.method !== 'GET' && request.method !== 'POST') {
+        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+    }
+
     // POST请求处理
     if (request.method === "POST") {
         if (!env.KV) return new Response("未绑定KV空间", { status: 400 });
@@ -2846,6 +3083,12 @@ async function bestIP(request, env, txt = 'ADD.txt') {
                 if (!data.ips || !Array.isArray(data.ips)) {
                     return new Response(JSON.stringify({ error: 'Invalid IP list' }), {
                         status: 400,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+                if (data.ips.length > 1000 || data.ips.some(ip => typeof ip !== 'string' || ip.length > 512)) {
+                    return new Response(JSON.stringify({ error: 'IP 列表超过数量或单项长度限制' }), {
+                        status: 413,
                         headers: { 'Content-Type': 'application/json' }
                     });
                 }
@@ -2918,6 +3161,9 @@ async function bestIP(request, env, txt = 'ADD.txt') {
             } else {
                 // 处理普通文本格式的保存请求（兼容原有功能）
                 const content = await request.text();
+                if (new TextEncoder().encode(content).byteLength > 2 * 1024 * 1024) {
+                    return new Response('内容超过 2 MiB 限制', { status: 413 });
+                }
                 await env.KV.put(txt, content);
                 return new Response("保存成功");
             }
@@ -3284,7 +3530,7 @@ async function bestIP(request, env, txt = 'ADD.txt') {
             <div class="progress-bar" id="progress-bar"></div>
         </div>
         <div class="test-info">
-            <p><strong>📊 测试说明：</strong>当前优选方式仅进行网络延迟测试，主要评估连接响应速度，并未包含带宽速度测试。延迟测试可快速筛选出响应最快的IP节点，适合日常使用场景的初步优选。</p>
+            <p><strong>📊 测试说明：</strong>这是浏览器侧的连接握手预筛选，不是 ICMP、真实代理延迟或带宽测试。证书与 CORS 限制会影响结果，请在客户端中复测后再长期使用。</p>
         </div>
     </div>
     
@@ -3446,8 +3692,13 @@ async function bestIP(request, env, txt = 'ADD.txt') {
                 }
             }
             
-            // 显示IP列表
-            ipList.innerHTML = displayIPs.map(ip => \`<div class="ip-item">\${ip}</div>\`).join('');
+            // 使用 textContent 渲染外部列表，避免备注中的 HTML 被执行。
+            ipList.replaceChildren(...displayIPs.map(ip => {
+                const item = document.createElement('div');
+                item.className = 'ip-item';
+                item.textContent = ip;
+                return item;
+            }));
         }
         
         function showMessage(text, type = 'success') {
@@ -3632,7 +3883,7 @@ async function bestIP(request, env, txt = 'ADD.txt') {
                 current.latency < best.latency ? current : best
             );
             
-            const displayLatency = Math.floor(bestResult.latency / 2);
+            const displayLatency = bestResult.latency;
             
             console.log(\`IP \${parsedIP.host}:\${parsedIP.port} 最终结果: \${displayLatency}ms (原始: \${bestResult.latency}ms, 共\${results.length}次有效测试)\`);
             
@@ -3692,19 +3943,17 @@ async function bestIP(request, env, txt = 'ADD.txt') {
         
         async function singleTest(ip, port, timeout) {
             const startTime = Date.now();
-            
+            let timeoutId;
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), timeout);
+                timeoutId = setTimeout(() => controller.abort(), timeout);
                 
                 const response = await fetch(\`https://\${ip}:\${port}/cdn-cgi/trace\`, {
                     signal: controller.signal,
                     mode: 'cors'
                 });
                 
-                clearTimeout(timeoutId);
-                // 如果请求成功了，说明这个IP不是我们要的
-                return null;
+                return { ip, port, latency: Date.now() - startTime };
                 
             } catch (error) {
                 const latency = Date.now() - startTime;
@@ -3724,6 +3973,8 @@ async function bestIP(request, env, txt = 'ADD.txt') {
                 }
                 
                 return null;
+            } finally {
+                clearTimeout(timeoutId);
             }
         }
         
@@ -3931,15 +4182,18 @@ async function bestIP(request, env, txt = 'ADD.txt') {
                 showMoreBtn.disabled = false; // 确保在结果显示时启用按钮
             }
             
-            const resultsHTML = displayedResults.map(result => {
+            const resultNodes = displayedResults.map(result => {
                 let className = 'good-latency';
                 if (result.latency > 200) className = 'bad-latency';
                 else if (result.latency > 100) className = 'medium-latency';
-                
-                return \`<div class="ip-item \${className}">\${result.display}</div>\`;
-            }).join('');
-            
-            ipList.innerHTML = resultsHTML;
+
+                const item = document.createElement('div');
+                item.className = \`ip-item \${className}\`;
+                item.textContent = result.display;
+                return item;
+            });
+
+            ipList.replaceChildren(...resultNodes);
             updateButtonStates();
         }
     </script>
@@ -3964,6 +4218,13 @@ async function bestIP(request, env, txt = 'ADD.txt') {
     return new Response(html, {
         headers: {
             'Content-Type': 'text/html; charset=UTF-8',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            'Referrer-Policy': 'no-referrer',
+            'Content-Security-Policy': "default-src 'self'; connect-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
         },
     });
+}
+
+return requestWorker;
 }

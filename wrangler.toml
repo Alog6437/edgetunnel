@@ -1,3 +1,21 @@
-name = "v20250626"
+name = "alog6437"
 main = "_worker.js"
-compatibility_date = "2025-06-26"
+compatibility_date = "2025-11-04"
+keep_vars = true
+
+# Configure ALLOWED_HOSTS as a Worker variable before using the tunnel.
+# No credentials or sample broad allowlist are deployed here.
+# Rate limits are per Cloudflare location and eventually consistent.
+[[ratelimits]]
+name = "TUNNEL_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
+
+#[[kv_namespaces]]
+#binding = "KV"			#KV绑定名默认不可修改
+#id = ""				#KV数据库id
